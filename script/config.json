@@ -1,0 +1,33 @@
+{
+    "db": {
+        "prod": [
+            {
+                "VAULT_NAMESPACE": "marketplace-cart-to-order",
+                "VERSION": "v2",
+                "DATABASE_CLUSTER_NAME": "item-postgres-v2",
+                "DATABASE_READ_ENDPOINT": "prod-item-postgres-v2.cluster-ro-clrz823v2njo.us-west-2.rds.amazonaws.com",
+                "DATABASE_NAME": "item"
+            }
+        ],
+        "qa": [
+            {
+                "VAULT_NAMESPACE": "credit",
+                "DATABASE_ROLE": "qa-bid-limit-postgres-v2-role",
+                "DATABASE_TYPE": "postgres",
+                "DATABASE_READ_ENDPOINT": "qa-bid-limit-postgres-v2.cluster-clrz823v2njo.us-west-2.rds.amazonaws.com",
+                "DATABASE_NAME": "bid_limit",
+                "K8S_NAMESPACE": "credit"
+            }
+        ],
+        "dev": [
+            {
+                "VAULT_NAMESPACE": "credit",
+                "DATABASE_ROLE": "dev-bid-limit-postgres-v2-role",
+                "DATABASE_TYPE": "postgres",
+                "DATABASE_READ_ENDPOINT": "dev-bid-limit-postgres-v2.cluster-clrz823v2njo.us-west-2.rds.amazonaws.com",
+                "DATABASE_NAME": "bid_limit",
+                "K8S_NAMESPACE": "credit"
+            }
+        ]
+    }
+}
