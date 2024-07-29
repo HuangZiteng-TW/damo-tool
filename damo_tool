@@ -1,0 +1,501 @@
+#!/bin/bash
+
+# Common define
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[0;37m'
+RESET='\033[0m'
+
+# Config
+PSQL_TMP_FILE_NAME=.psql.json
+CONFIG_FILE_NAME=config.json
+DB_CONFIG_OBJ_NAME=db
+PSQL_TOKEN_EXPIRE_TIME=3600
+PGADMIN_PORT=18080
+PGADMIN_PORT_CHECK_INTERVAL=2
+PGADMIN_FORWARD_CHECK_INTERVAL=5
+VAULT_OIDC_ROLE="marketplace-damo-oidc-role"
+
+# Global var
+RBCTL_ENV=""
+DATABASE_ENV=""
+DATABASE_NAME=""
+DATABASE_HOST_URL=""
+DATABASE_CLUSTER_NAME=""
+DATABASE_VALUT_NAMESPACE=""
+DATABASE_USER=""
+DATABASE_PASSWORD=""
+K8S_NAMESPACE=""
+POD_NAME=""
+QUERY=""
+DB_CONFIG="[]"
+DB_CONFIG_LENGTH=0
+DB_SELECTED_CONFIG_IDX=0
+ENV_SELECTED_CONFIG_IDX=0
+PGADMIN_CHECK_PID=""
+PGADMIN_FORWARD_PID=""
+
+killChildProcess() {
+  if [ -n "$PGADMIN_CHECK_PID" ]; then
+    echo "Terminating child process (PID $PGADMIN_CHECK_PID)..."
+    kill $PGADMIN_CHECK_PID
+    wait $PGADMIN_CHECK_PID
+    PGADMIN_CHECK_PID=""
+  fi
+  if [ -n "$PGADMIN_FORWARD_PID" ]; then
+    echo "Terminating child process (PID $PGADMIN_FORWARD_PID)..."
+    kill $PGADMIN_FORWARD_PID
+    wait $PGADMIN_FORWARD_PID
+    PGADMIN_FORWARD_PID=""
+  fi
+}
+
+signalCallback() {
+  killChildProcess
+  destroySqlNonprodConnector
+  exit 0
+}
+
+prerequestCheck() {
+  gum -v &>/dev/null
+  if [ $? -ne 0 ]; then
+    brew install gum
+  fi
+  jq --version &>/dev/null
+  if [ $? -ne 0 ]; then
+    brew install jq
+  fi
+}
+
+rbctlLogin() {
+  echo "login to rbctl $RBCTL_ENV..."
+  rbctl login --env ${RBCTL_ENV}
+}
+
+valutLogin() {
+  export VAULT_NAMESPACE=/admin/$DATABASE_VALUT_NAMESPACE
+  export VAULT_LOGIN_NAMESPACE=/admin
+  export VAULT_ADDR=https://marketplace-nonprod-vault-cluster.vault.a8ac8847-786e-4c3e-b97a-34e8978986f4.aws.hashicorp.cloud:8200/
+
+  vault token lookup &>/dev/null ||
+    (
+      printf "\e[1;32;m"
+      VAULT_NAMESPACE="$VAULT_LOGIN_NAMESPACE" \
+        vault login -method=oidc role=$VAULT_OIDC_ROLE
+      printf "\e[;m"
+    )
+
+  VAULT_TOKEN="$(vault print token)"
+}
+
+createPsqlPod() {
+  curDate=$(date '+%s')
+  if [ -f $PSQL_TMP_FILE_NAME ] && [ $(cat $PSQL_TMP_FILE_NAME | jq -r .date) -gt $curDate ]; then
+    psqlClient=$(cat $PSQL_TMP_FILE_NAME)
+  else
+    curDate=$((curDate + $PSQL_TOKEN_EXPIRE_TIME))
+    psqlClient=$(rbctl psql-client create --team marketplace-damo --description "debug tickets")
+    psqlClient=$(echo $psqlClient | jq ".date=$curDate")
+    echo $psqlClient >$PSQL_TMP_FILE_NAME
+  fi
+  echo $psqlClient | jq -r .
+
+  JOB_NAME=$(echo $psqlClient | jq -r .job_name)
+  TOKEN=$(echo $psqlClient | jq -r .token)
+}
+
+startSqlExecutor() {
+  kubectl exec -it $(kubectl get pod -l job-name="$JOB_NAME" -n database-access -o jsonpath='{.items[0].metadata.name}' --token "$TOKEN") -n database-access --token "$TOKEN" -- psql postgres://${USER_NAME}:${PGPASSWORD}@${DATABASE_HOST_URL}:5432/${DATABASE_NAME} -c "$1"
+}
+
+startSqlConnector() {
+  kubectl exec -it $(kubectl get pod -l job-name="$JOB_NAME" -n database-access -o jsonpath='{.items[0].metadata.name}' --token "$TOKEN") -n database-access --token "$TOKEN" -- psql postgres://${USER_NAME}:${PGPASSWORD}@${DATABASE_HOST_URL}:5432/${DATABASE_NAME}
+}
+
+startSqlNonprodExecutor() {
+  kubectl -n "$K8S_NAMESPACE" exec -it "pod/$POD_NAME" -- env PGPASSWORD="$DATABASE_PASSWORD" psql -h "$DATABASE_HOST_URL" -U "$DATABASE_USER" -d "$DATABASE_NAME" -c "$1"
+}
+
+startSqlNonprodConnector() {
+  kubectl -n "$K8S_NAMESPACE" exec -it "pod/$POD_NAME" -- env PGPASSWORD="$DATABASE_PASSWORD" psql -h "$DATABASE_HOST_URL" -U "$DATABASE_USER" -d "$DATABASE_NAME"
+}
+
+destroySqlNonprodConnector() {
+  if [[ $POD_NAME != "" ]]; then
+    kubectl -n "$K8S_NAMESPACE" get "pod/$POD_NAME" | grep Running >/dev/null
+
+    if [ $? -eq 0 ]; then
+      kubectl -n "$K8S_NAMESPACE" delete "pod/$POD_NAME" &>/dev/null &
+      POD_NAME=""
+    fi
+  fi
+}
+
+waitSqlNonprodPodAvailable() {
+  echo "Waiting for container to come up..."
+  while ! kubectl -n "$K8S_NAMESPACE" get "pod/$POD_NAME" | grep Running >/dev/null; do
+    sleep 1
+  done
+}
+
+createNonProdPsqlPod() {
+  cat <<EOF | kubectl -n "$K8S_NAMESPACE" apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "$POD_NAME"
+  labels:
+    app: "$POD_NAME"
+spec:
+  imagePullSecrets:
+    - name: registry-credential
+  securityContext:
+    runAsUser: 1000
+  containers:
+    - name: "$POD_NAME"
+      image: "$CONTAINER_IMAGE"
+      imagePullPolicy: Always
+      stdin: true
+      tty: true
+      command: [ "/bin/sh" ]
+      resources:
+        requests:
+          cpu: 200m
+          memory: 128Mi
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+EOF
+  waitSqlNonprodPodAvailable
+}
+
+showDBConfig() {
+  CONFIG=$(cat $CONFIG_FILE_NAME)
+  DB_CONFIG=$(echo $CONFIG | jq -r ".$DB_CONFIG_OBJ_NAME")
+  DB_CONFIG_LENGTH=$(echo $DB_CONFIG | jq ".$DATABASE_ENV | length")
+
+  echo
+  echo "DB Config lists:"
+  printf "idx   db_name\r\n"
+  for ((i = 0; i < $DB_CONFIG_LENGTH; i++)); do
+    dbname=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$i].DATABASE_NAME")
+    if [ $DATABASE_ENV == "qa" ] || [ $DATABASE_ENV == "dev" ]; then
+      dbtype=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$i].DATABASE_TYPE")
+      printf "%3d : %s (%s)\r\n" $((i + 1)) $dbname $dbtype
+    else
+      printf "%3d : %s\r\n" $((i + 1)) $dbname
+    fi
+
+  done
+}
+
+selectDBConfig() {
+  while true; do
+    echo -n -e "${BLUE}Please select db config idx(1 ~ $DB_CONFIG_LENGTH): ${RESET}"
+    read DB_SELECTED_CONFIG_IDX
+    if [ -z "$DB_SELECTED_CONFIG_IDX" ]; then
+      echo "input invalid."
+      read -s -n1 -p "Press any key to retry."
+      echo  
+    elif [ $DB_SELECTED_CONFIG_IDX -ge 1 ] && [ $DB_SELECTED_CONFIG_IDX -le $DB_CONFIG_LENGTH ]; then
+      DB_SELECTED_CONFIG_IDX=$(($DB_SELECTED_CONFIG_IDX - 1))
+      DATABASE_NAME=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$DB_SELECTED_CONFIG_IDX].DATABASE_NAME")
+      DATABASE_HOST_URL=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$DB_SELECTED_CONFIG_IDX].DATABASE_READ_ENDPOINT")
+
+      echo $DATABASE_NAME
+      echo $DATABASE_HOST_URL
+
+      if [ $DATABASE_ENV == "qa" ] || [ $DATABASE_ENV == "dev" ]; then
+        DATABASE_VALUT_NAMESPACE=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$DB_SELECTED_CONFIG_IDX].VAULT_NAMESPACE")
+        K8S_NAMESPACE="$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$DB_SELECTED_CONFIG_IDX].K8S_NAMESPACE")-$DATABASE_ENV"
+        DATABASE_ROLE=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$DB_SELECTED_CONFIG_IDX].DATABASE_ROLE")
+
+        echo $DATABASE_VALUT_NAMESPACE
+        echo $K8S_NAMESPACE
+        echo $DATABASE_ROLE
+      else
+        DATABASE_CLUSTER_NAME=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$DB_SELECTED_CONFIG_IDX].DATABASE_CLUSTER_NAME")
+
+        echo $DATABASE_CLUSTER_NAME
+      fi
+
+      break
+    else
+      echo "input invalid."
+      read -s -n1 -p "Press any key to retry."
+      echo
+    fi
+  done
+}
+
+getDBCredential() {
+  case $DATABASE_ENV in
+  dev | qa)
+    valutLogin
+    local creds=$(vault read --format json "database/creds/$DATABASE_ROLE")
+    DATABASE_USER=$(echo $creds | jq -r .data.username)
+    DATABASE_PASSWORD=$(echo $creds | jq -r .data.password)
+    ;;
+  prod)
+    psqlClient=$(rbctl psql-client create --team marketplace-damo --description "debug tickets")
+    dbCreds=$(rbctl database-credential create --team marketplace-damo --database-cluster-name $DATABASE_CLUSTER_NAME)
+
+    USER_NAME=$(echo $dbCreds | jq -r .username)
+    PGPASSWORD=$(echo $dbCreds | jq -r .password)
+
+    echo $JOB_NAME
+    echo $TOKEN
+    echo $DATABASE_HOST_URL
+    echo $DATABASE_NAME
+    echo $USER_NAME
+    echo $PGPASSWORD
+    ;;
+  esac
+}
+
+step1_mode() {
+  # clear
+  cat <<EOF
+
+Mode Options:
+  query   | e   : Execute query by psql
+  cmd     | c   : Open psql command-line
+  pgadmin | p   : Start PgAdmin web(only for nonprod env)
+  reset   | r   : Reset tool and relogin rbctl
+  quit    | q   : Quit
+EOF
+
+  echo -n -e "${BLUE}Please select mode: ${RESET}"
+  read MODE
+}
+
+step2_selectEnv() {
+  local env_var_name=$1
+  shift
+  local env_configs=("$@")
+  local env_config_length=${#env_configs[*]}
+  while true; do
+    local i=1
+    echo "Env lists:"
+    printf "idx   env_name\r\n"
+    for envname in "${env_configs[@]}"; do
+      printf "%3d : %s\r\n" $i $envname
+      ((i++))
+    done
+
+    echo -n -e "${BLUE}Please select env config idx(1 ~ $env_config_length): ${RESET}"
+    read ENV_SELECTED_CONFIG_IDX
+    if [ -z "$DB_SELECTED_CONFIG_IDX" ]; then
+      echo "input invalid."
+      read -s -n1 -p "Press any key to retry."
+      echo  
+    elif [ $ENV_SELECTED_CONFIG_IDX -ge 1 ] && [ $ENV_SELECTED_CONFIG_IDX -le $env_config_length ]; then
+      ENV_SELECTED_CONFIG_IDX=$(($ENV_SELECTED_CONFIG_IDX - 1))
+      eval "$env_var_name=${env_configs[$ENV_SELECTED_CONFIG_IDX]}"
+      break
+    else
+      echo "input invalid."
+      read -s -n1 -p "Press any key to retry."
+      echo
+    fi
+  done
+}
+
+step2_checkRbctlEnv() {
+  case $DATABASE_ENV in
+  dev | qa)
+    kubectl config get-contexts | grep "*" | grep di-us-west-2-nonprod &>/dev/null ||
+      (
+        RBCTL_ENV=nonprod
+        rbctlLogin
+      )
+    ;;
+  prod)
+    kubectl config get-contexts | grep "*" | grep di-us-west-2-prod &>/dev/null ||
+      (
+        RBCTL_ENV=prod
+        rbctlLogin
+      )
+    ;;
+  esac
+}
+
+step3_createPsqlPod() {
+  # clear
+  # rbctlLogin
+  case $DATABASE_ENV in
+  dev | qa)
+    POD_NAME="postgresql-client-$(whoami | tr -d '.')"
+    CONTAINER_IMAGE=ghcr.io/rbmarketplace/postgresql-client:13.6
+    createNonProdPsqlPod
+    ;;
+  prod)
+    createPsqlPod
+    ;;
+  esac
+}
+
+step3_selectDB() {
+  # clear
+  showDBConfig
+  selectDBConfig
+  getDBCredential
+}
+
+step3_checkPsqlPort() {
+  while true; do
+    lsof -iTCP -sTCP:LISTEN | grep $PGADMIN_PORT &>/dev/null || break
+    echo "Port $PGADMIN_PORT has been used!"
+    sleep $PGADMIN_PORT_CHECK_INTERVAL
+  done
+}
+
+step3_connectPsql() {
+
+  while true; do
+    lsof -iTCP -sTCP:LISTEN | grep $PGADMIN_PORT
+
+    if [ $? -ne 0 ]; then
+      echo "Connection lost. Re-establishing port-forward(PORT:$PGADMIN_PORT)..."
+      kubectl port-forward -n damo-dev deploy/pgadmin4 $PGADMIN_PORT:80 &
+      PGADMIN_FORWARD_PID=$!
+    fi
+
+    sleep $PGADMIN_FORWARD_CHECK_INTERVAL
+  done
+}
+
+step4_createDBConnection() {
+  # clear
+  case $DATABASE_ENV in
+  dev | qa)
+    startSqlNonprodConnector
+    destroySqlNonprodConnector
+    ;;
+  prod)
+    startSqlConnector
+    ;;
+  esac
+
+  read -s -n1 -p "Press any key."
+}
+
+step4_inputDBQuery() {
+  # clear
+  echo -n -e "${BLUE}Please input query: ${RESET}"
+  read QUERY
+
+  case $DATABASE_ENV in
+  qa | dev)
+    startSqlNonprodExecutor "$QUERY;"
+    destroySqlNonprodConnector
+    ;;
+  prod)
+    startSqlExecutor "$QUERY;"
+    ;;
+  esac
+
+  read -s -n1 -p "Press any key."
+}
+
+step4_dbCredential() {
+  CONFIG=$(cat $CONFIG_FILE_NAME)
+  DB_CONFIG=$(echo $CONFIG | jq -r ".$DB_CONFIG_OBJ_NAME")
+  DB_CONFIG_LENGTH=$(echo $DB_CONFIG | jq ".$DATABASE_ENV | length")
+
+  while true; do
+    echo
+    echo "DB Config lists:"
+    printf "  option   db name/descript\r\n"
+    for ((i = 0; i < $DB_CONFIG_LENGTH; i++)); do
+      dbname=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$i].DATABASE_NAME")
+      dbtype=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$i].DATABASE_TYPE")
+      printf "%6d   : %s (%s)\r\n" $((i + 1)) $dbname $dbtype
+    done
+    printf "quit | q : Quit pgadmin port forward.\r\n"
+
+    echo -n -e "${BLUE}Please select option: ${RESET}"
+    read DB_SELECTED_CONFIG_IDX
+    if [ -z "$DB_SELECTED_CONFIG_IDX" ]; then
+      echo "input invalid."
+      read -s -n1 -p "Press any key to retry."
+      echo  
+    elif [ $DB_SELECTED_CONFIG_IDX == "q" ] || [ $DB_SELECTED_CONFIG_IDX == "quit" ]; then
+      killChildProcess
+      break
+    elif [ $DB_SELECTED_CONFIG_IDX -ge 1 ] && [ $DB_SELECTED_CONFIG_IDX -le $DB_CONFIG_LENGTH ]; then
+      DB_SELECTED_CONFIG_IDX=$(($DB_SELECTED_CONFIG_IDX - 1))
+      DATABASE_NAME=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$DB_SELECTED_CONFIG_IDX].DATABASE_NAME")
+      DATABASE_HOST_URL=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$DB_SELECTED_CONFIG_IDX].DATABASE_READ_ENDPOINT")
+      DATABASE_VALUT_NAMESPACE=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$DB_SELECTED_CONFIG_IDX].VAULT_NAMESPACE")
+      DATABASE_ROLE=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$DB_SELECTED_CONFIG_IDX].DATABASE_ROLE")
+
+      echo $DATABASE_NAME
+      echo -e "${GREEN}$DATABASE_HOST_URL${RESET}"
+      echo $DATABASE_VALUT_NAMESPACE
+
+      valutLogin
+      (
+        printf "$GREEN"
+        vault read --format json "database/creds/$DATABASE_ROLE"
+        printf "$RESET"
+      )
+
+      read -s -n1 -p "Press any key."
+    else
+      echo "input invalid."
+      read -s -n1 -p "Press any key to retry."
+      echo
+    fi
+  done
+}
+
+prerequestCheck
+trap signalCallback SIGTERM SIGINT
+
+while true; do
+  step1_mode
+  case $MODE in
+  query | e)
+    step2_selectEnv DATABASE_ENV dev qa prod
+    step2_checkRbctlEnv
+    step3_selectDB
+    step3_createPsqlPod
+    step4_inputDBQuery
+    ;;
+  cmd | c)
+    step2_selectEnv DATABASE_ENV dev qa prod
+    step2_checkRbctlEnv
+    step3_selectDB
+    step3_createPsqlPod
+    step4_createDBConnection
+    ;;
+  pgadmin | p)
+    step2_selectEnv DATABASE_ENV dev qa
+    step2_checkRbctlEnv
+    step3_checkPsqlPort
+    (
+      trap signalCallback SIGTERM SIGINT
+      step3_connectPsql &>/dev/null
+    ) &
+    PGADMIN_CHECK_PID=$!
+    (
+      sleep 2
+      open http://localhost:18080/pgadmin4/browser/
+    ) &
+    step4_dbCredential
+    ;;
+  reset | r)
+    step2_selectEnv RBCTL_ENV prod nonprod
+    rm $PSQL_TMP_FILE_NAME
+    rbctlLogin
+    ;;
+  quit | q)
+    exit 0
+    ;;
+  esac
+done
