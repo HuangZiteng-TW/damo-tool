@@ -61,6 +61,11 @@ signalCallback() {
 }
 
 prerequestCheck() {
+  if [ ! -f "./$CONFIG_FILE_NAME" ]; then
+    echo "Config file(./$CONFIG_FILE_NAME) not exist!"
+    exit -1
+  fi
+
   gum -v &>/dev/null
   if [ $? -ne 0 ]; then
     brew install gum
