@@ -66,10 +66,10 @@ prerequestCheck() {
     exit -1
   fi
 
-  gum -v &>/dev/null
-  if [ $? -ne 0 ]; then
-    brew install gum
-  fi
+  # gum -v &>/dev/null
+  # if [ $? -ne 0 ]; then
+  #   brew install gum
+  # fi
   jq --version &>/dev/null
   if [ $? -ne 0 ]; then
     brew install jq
@@ -104,6 +104,7 @@ createPsqlPod() {
   else
     curDate=$((curDate + $PSQL_TOKEN_EXPIRE_TIME))
     psqlClient=$(rbctl psql-client create --team marketplace-damo --description "debug tickets")
+
     psqlClient=$(echo $psqlClient | jq ".date=$curDate")
     echo $psqlClient >$PSQL_TMP_FILE_NAME
   fi
@@ -187,9 +188,9 @@ showDBConfig() {
   echo "DB Config lists:"
   printf "idx   db_name\r\n"
   for ((i = 0; i < $DB_CONFIG_LENGTH; i++)); do
-    dbname=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$i].DATABASE_NAME")
+    dbname=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV[$i].DATABASE_NAME")
     if [ $DATABASE_ENV == "qa" ] || [ $DATABASE_ENV == "dev" ]; then
-      dbtype=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$i].DATABASE_TYPE")
+      dbtype=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV[$i].DATABASE_TYPE")
       printf "%3d : %s (%s)\r\n" $((i + 1)) $dbname $dbtype
     else
       printf "%3d : %s\r\n" $((i + 1)) $dbname
@@ -205,7 +206,7 @@ selectDBConfig() {
     if [ -z "$DB_SELECTED_CONFIG_IDX" ]; then
       echo "input invalid."
       read -s -n1 -p "Press any key to retry."
-      echo  
+      echo
     elif [ $DB_SELECTED_CONFIG_IDX -ge 1 ] && [ $DB_SELECTED_CONFIG_IDX -le $DB_CONFIG_LENGTH ]; then
       DB_SELECTED_CONFIG_IDX=$(($DB_SELECTED_CONFIG_IDX - 1))
       DATABASE_NAME=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$DB_SELECTED_CONFIG_IDX].DATABASE_NAME")
@@ -242,12 +243,23 @@ getDBCredential() {
   dev | qa)
     valutLogin
     local creds=$(vault read --format json "database/creds/$DATABASE_ROLE")
+
+    echo $creds | jq '.' 2>/dev/null
+    if [[ $? -ne 0 ]]; then
+      echo -e "${RED}${creds}${RESET}"
+    fi
+
     DATABASE_USER=$(echo $creds | jq -r .data.username)
     DATABASE_PASSWORD=$(echo $creds | jq -r .data.password)
     ;;
   prod)
     psqlClient=$(rbctl psql-client create --team marketplace-damo --description "debug tickets")
     dbCreds=$(rbctl database-credential create --team marketplace-damo --database-cluster-name $DATABASE_CLUSTER_NAME)
+
+    echo $dbCreds | jq '.' 2>/dev/null
+    if [[ $? -ne 0 ]]; then
+      echo -e "${RED}${dbCreds}${RESET}"
+    fi
 
     USER_NAME=$(echo $dbCreds | jq -r .username)
     PGPASSWORD=$(echo $dbCreds | jq -r .password)
@@ -297,7 +309,7 @@ step2_selectEnv() {
     if [ -z "$DB_SELECTED_CONFIG_IDX" ]; then
       echo "input invalid."
       read -s -n1 -p "Press any key to retry."
-      echo  
+      echo
     elif [ $ENV_SELECTED_CONFIG_IDX -ge 1 ] && [ $ENV_SELECTED_CONFIG_IDX -le $env_config_length ]; then
       ENV_SELECTED_CONFIG_IDX=$(($ENV_SELECTED_CONFIG_IDX - 1))
       eval "$env_var_name=${env_configs[$ENV_SELECTED_CONFIG_IDX]}"
@@ -417,8 +429,8 @@ step4_dbCredential() {
     echo "DB Config lists:"
     printf "  option   db name/descript\r\n"
     for ((i = 0; i < $DB_CONFIG_LENGTH; i++)); do
-      dbname=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$i].DATABASE_NAME")
-      dbtype=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV.[$i].DATABASE_TYPE")
+      dbname=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV[$i].DATABASE_NAME")
+      dbtype=$(echo $DB_CONFIG | jq -r ".$DATABASE_ENV[$i].DATABASE_TYPE")
       printf "%6d   : %s (%s)\r\n" $((i + 1)) $dbname $dbtype
     done
     printf "quit | q : Quit pgadmin port forward.\r\n"
@@ -428,7 +440,7 @@ step4_dbCredential() {
     if [ -z "$DB_SELECTED_CONFIG_IDX" ]; then
       echo "input invalid."
       read -s -n1 -p "Press any key to retry."
-      echo  
+      echo
     elif [ $DB_SELECTED_CONFIG_IDX == "q" ] || [ $DB_SELECTED_CONFIG_IDX == "quit" ]; then
       killChildProcess
       break
